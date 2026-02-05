@@ -1157,7 +1157,8 @@ export_cluster_gene_lists <- function(cluster_result, results_df, output_dir, me
 # Plot top genes per cluster (profiles)
 plot_cluster_top_genes_profiles <- function(cluster_result, expr_data, results_df, 
                                             design, time_column, output_dir, 
-                                            method_name, n_top = 20) {
+                                            method_name, n_top = 20, group_column = NULL,
+                                            compare_groups = NULL) {
   vcat("  Creating per-cluster top genes profile plots...\n")
   
   # Determine p-value column
@@ -1190,10 +1191,19 @@ plot_cluster_top_genes_profiles <- function(cluster_result, expr_data, results_d
                         sprintf("cluster_%d_%s_top20_profiles.pdf", i,
                                gsub(" ", "_", cluster_result$pattern_types[i])))
     
-    plot_timecourse_profiles(
-      expr_data, design, time_column, top_genes, outfile,
-      sprintf("%s - Cluster %d (%s)", method_name, i, cluster_result$pattern_types[i])
-    )
+    # Use group comparison plot if group_column is provided
+    if (!is.null(group_column) && !is.null(compare_groups)) {
+      plot_group_comparison_profiles(
+        expr_data, design, time_column, group_column, compare_groups,
+        top_genes, outfile,
+        sprintf("%s - Cluster %d (%s)", method_name, i, cluster_result$pattern_types[i])
+      )
+    } else {
+      plot_timecourse_profiles(
+        expr_data, design, time_column, top_genes, outfile,
+        sprintf("%s - Cluster %d (%s)", method_name, i, cluster_result$pattern_types[i])
+      )
+    }
     
     vcat(sprintf("    Cluster %d (%s): %d genes\n", i, 
                 cluster_result$pattern_types[i], length(top_genes)))
@@ -2299,7 +2309,9 @@ main <- function() {
         params$time_column,
         file.path(params$output_dir, tolower(gsub("-", "_", cluster_method_name))),
         cluster_method_name,
-        n_top = 20
+        n_top = 20,
+        group_column = if (params$test_interaction) params$group_column else NULL,
+        compare_groups = if (params$test_interaction) params$compare_groups else NULL
       )
       
       plot_cluster_top_genes_heatmaps(
