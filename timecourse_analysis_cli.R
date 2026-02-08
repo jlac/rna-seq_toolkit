@@ -593,6 +593,13 @@ run_limma_analysis <- function(counts, design, params) {
     vcat("  Testing interaction coefficients:", paste(interaction_coefs, collapse=", "), "\n")
     results <- topTable(fit, coef = interaction_coefs, number = Inf, sort.by = "F")
     
+    # Add meaningful interaction fold changes
+    if (params$time_as_numeric) {
+      results <- add_interaction_fold_changes(results, v$E, design, 
+                                             params$time_column, params$group_column,
+                                             params$compare_groups)
+    }
+    
     result_file <- file.path(params$output_dir, "limma", 
                             "limma_interaction_results.txt")
   } else {
@@ -609,6 +616,12 @@ run_limma_analysis <- function(counts, design, params) {
     
     vcat("  Testing time effect with coefficients:", paste(time_coefs, collapse=", "), "\n")
     results <- topTable(fit, coef = time_coefs, number = Inf, sort.by = "F")
+    
+    # Add meaningful fold changes (last vs first timepoint) for interpretation
+    if (params$time_as_numeric) {
+      results <- add_timecourse_fold_changes(results, v$E, design, params$time_column, 
+                                            test_interaction = FALSE)
+    }
     
     result_file <- file.path(params$output_dir, "limma", 
                             "limma_time_effect_results.txt")
@@ -771,6 +784,22 @@ run_deseq2_analysis <- function(counts, design, params) {
   # Convert to data frame
   results_df <- as.data.frame(res)
   
+  # Add meaningful fold changes
+  # Get normalized counts
+  norm_counts <- counts(dds, normalized = TRUE)
+  
+  if (params$test_interaction && params$time_as_numeric) {
+    # Add interaction fold changes for differential timecourse
+    results_df <- add_interaction_fold_changes(results_df, log2(norm_counts + 1), 
+                                              design, params$time_column,
+                                              params$group_column, params$compare_groups)
+  } else if (!params$test_interaction && params$time_as_numeric) {
+    # Add standard timecourse fold changes
+    results_df <- add_timecourse_fold_changes(results_df, log2(norm_counts + 1), 
+                                             design, params$time_column,
+                                             test_interaction = FALSE)
+  }
+  
   # Save results
   write.table(results_df, file = result_file,
               sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
@@ -789,6 +818,201 @@ run_deseq2_analysis <- function(counts, design, params) {
     design = design,
     counts = counts
   ))
+}
+
+################################################################################
+# FOLD CHANGE CALCULATION FOR TIMECOURSE
+################################################################################
+
+# Calculate meaningful fold changes (last vs first timepoint) for timecourse
+add_timecourse_fold_changes <- function(results_df, expr_data, design, time_column,
+                                       test_interaction = FALSE) {
+  vcat("  Calculating Last vs First timepoint fold changes...\n")
+  
+  # Get time values
+  time_values <- design[[time_column]]
+  
+  # Identify first and last timepoints
+  time_numeric <- suppressWarnings(as.numeric(as.character(time_values)))
+  if (all(!is.na(time_numeric))) {
+    first_timepoint <- min(time_numeric)
+    last_timepoint <- max(time_numeric)
+    time_is_numeric <- TRUE
+  } else {
+    time_factor <- factor(time_values)
+    first_timepoint <- levels(time_factor)[1]
+    last_timepoint <- levels(time_factor)[nlevels(time_factor)]
+    time_is_numeric <- FALSE
+  }
+  
+  vcat(sprintf("    First timepoint: %s\n", first_timepoint))
+  vcat(sprintf("    Last timepoint: %s\n", last_timepoint))
+  
+  # Get samples for each timepoint
+  first_samples <- rownames(design)[as.character(time_values) == as.character(first_timepoint)]
+  last_samples <- rownames(design)[as.character(time_values) == as.character(last_timepoint)]
+  
+  # Match with expression data columns
+  first_samples <- intersect(first_samples, colnames(expr_data))
+  last_samples <- intersect(last_samples, colnames(expr_data))
+  
+  if (length(first_samples) == 0 || length(last_samples) == 0) {
+    vcat("    Warning: Could not find samples for first/last timepoint\n")
+    return(results_df)
+  }
+  
+  vcat(sprintf("    Samples at first timepoint: %d\n", length(first_samples)))
+  vcat(sprintf("    Samples at last timepoint: %d\n", length(last_samples)))
+  
+  # Calculate mean expression at first and last timepoints
+  first_expr <- rowMeans(expr_data[, first_samples, drop=FALSE])
+  last_expr <- rowMeans(expr_data[, last_samples, drop=FALSE])
+  
+  # Calculate log2 fold change (last vs first)
+  # Use pseudocount to avoid log(0)
+  pseudocount <- 0.1
+  log2fc <- log2((last_expr + pseudocount) / (first_expr + pseudocount))
+  
+  # Add to results (match by gene names)
+  genes_in_results <- rownames(results_df)
+  results_df$First_Timepoint_Mean <- first_expr[genes_in_results]
+  results_df$Last_Timepoint_Mean <- last_expr[genes_in_results]
+  results_df$Log2FC_Last_vs_First <- log2fc[genes_in_results]
+  results_df$FC_Last_vs_First <- 2^results_df$Log2FC_Last_vs_First
+  
+  # Add interpretation
+  results_df$Temporal_Direction <- ifelse(results_df$Log2FC_Last_vs_First > 0.5, "Upregulated",
+                                         ifelse(results_df$Log2FC_Last_vs_First < -0.5, 
+                                               "Downregulated", "Stable"))
+  
+  # Summary
+  n_up <- sum(results_df$Temporal_Direction == "Upregulated", na.rm=TRUE)
+  n_down <- sum(results_df$Temporal_Direction == "Downregulated", na.rm=TRUE)
+  n_stable <- sum(results_df$Temporal_Direction == "Stable", na.rm=TRUE)
+  
+  vcat(sprintf("    Temporal trends (Last vs First):\n"))
+  vcat(sprintf("      Upregulated (log2FC > 0.5): %d genes\n", n_up))
+  vcat(sprintf("      Downregulated (log2FC < -0.5): %d genes\n", n_down))
+  vcat(sprintf("      Stable (|log2FC| < 0.5): %d genes\n", n_stable))
+  
+  return(results_df)
+}
+
+# Calculate meaningful interaction fold changes
+add_interaction_fold_changes <- function(results_df, expr_data, design, time_column,
+                                        group_column, compare_groups) {
+  vcat("  Calculating interaction fold changes (differential timecourse)...\n")
+  
+  # Get time values
+  time_values <- design[[time_column]]
+  group_values <- design[[group_column]]
+  
+  # Identify first and last timepoints
+  time_numeric <- suppressWarnings(as.numeric(as.character(time_values)))
+  if (all(!is.na(time_numeric))) {
+    first_timepoint <- min(time_numeric)
+    last_timepoint <- max(time_numeric)
+  } else {
+    time_factor <- factor(time_values)
+    first_timepoint <- levels(time_factor)[1]
+    last_timepoint <- levels(time_factor)[nlevels(time_factor)]
+  }
+  
+  vcat(sprintf("    Groups: %s vs %s\n", compare_groups[1], compare_groups[2]))
+  vcat(sprintf("    First timepoint: %s\n", first_timepoint))
+  vcat(sprintf("    Last timepoint: %s\n", last_timepoint))
+  
+  # Get samples for each group x timepoint combination
+  g1_first <- rownames(design)[group_values == compare_groups[1] & 
+                                as.character(time_values) == as.character(first_timepoint)]
+  g1_last <- rownames(design)[group_values == compare_groups[1] & 
+                               as.character(time_values) == as.character(last_timepoint)]
+  g2_first <- rownames(design)[group_values == compare_groups[2] & 
+                                as.character(time_values) == as.character(first_timepoint)]
+  g2_last <- rownames(design)[group_values == compare_groups[2] & 
+                               as.character(time_values) == as.character(last_timepoint)]
+  
+  # Match with expression data
+  g1_first <- intersect(g1_first, colnames(expr_data))
+  g1_last <- intersect(g1_last, colnames(expr_data))
+  g2_first <- intersect(g2_first, colnames(expr_data))
+  g2_last <- intersect(g2_last, colnames(expr_data))
+  
+  if (length(g1_first) == 0 || length(g1_last) == 0 || 
+      length(g2_first) == 0 || length(g2_last) == 0) {
+    vcat("    Warning: Could not find samples for all group x timepoint combinations\n")
+    return(results_df)
+  }
+  
+  vcat(sprintf("    %s samples: first=%d, last=%d\n", 
+              compare_groups[1], length(g1_first), length(g1_last)))
+  vcat(sprintf("    %s samples: first=%d, last=%d\n",
+              compare_groups[2], length(g2_first), length(g2_last)))
+  
+  # Calculate mean expression for each group x timepoint
+  g1_first_expr <- rowMeans(expr_data[, g1_first, drop=FALSE])
+  g1_last_expr <- rowMeans(expr_data[, g1_last, drop=FALSE])
+  g2_first_expr <- rowMeans(expr_data[, g2_first, drop=FALSE])
+  g2_last_expr <- rowMeans(expr_data[, g2_last, drop=FALSE])
+  
+  # Calculate fold changes for each group
+  pseudocount <- 0.1
+  g1_log2fc <- log2((g1_last_expr + pseudocount) / (g1_first_expr + pseudocount))
+  g2_log2fc <- log2((g2_last_expr + pseudocount) / (g2_first_expr + pseudocount))
+  
+  # Calculate interaction fold change (difference in temporal changes)
+  interaction_log2fc <- g2_log2fc - g1_log2fc
+  
+  # Add to results
+  genes_in_results <- rownames(results_df)
+  
+  # Group 1 columns
+  results_df[[paste0(compare_groups[1], "_First_Mean")]] <- g1_first_expr[genes_in_results]
+  results_df[[paste0(compare_groups[1], "_Last_Mean")]] <- g1_last_expr[genes_in_results]
+  results_df[[paste0(compare_groups[1], "_Log2FC")]] <- g1_log2fc[genes_in_results]
+  
+  # Group 2 columns
+  results_df[[paste0(compare_groups[2], "_First_Mean")]] <- g2_first_expr[genes_in_results]
+  results_df[[paste0(compare_groups[2], "_Last_Mean")]] <- g2_last_expr[genes_in_results]
+  results_df[[paste0(compare_groups[2], "_Log2FC")]] <- g2_log2fc[genes_in_results]
+  
+  # Interaction columns
+  results_df$Interaction_Log2FC <- interaction_log2fc[genes_in_results]
+  results_df$Interaction_FC <- 2^results_df$Interaction_Log2FC
+  
+  # Classify interaction patterns
+  g1_fc <- results_df[[paste0(compare_groups[1], "_Log2FC")]]
+  g2_fc <- results_df[[paste0(compare_groups[2], "_Log2FC")]]
+  int_fc <- results_df$Interaction_Log2FC
+  
+  results_df$Interaction_Pattern <- ifelse(
+    abs(int_fc) < 0.5, "Concordant",
+    ifelse(int_fc > 0.5 & g1_fc > 0 & g2_fc > 0, "Enhanced_Up",
+    ifelse(int_fc > 0.5 & g1_fc < 0 & g2_fc < 0, "Enhanced_Down",
+    ifelse(int_fc < -0.5 & g1_fc > 0 & g2_fc > 0, "Suppressed_Up",
+    ifelse(int_fc < -0.5 & g1_fc < 0 & g2_fc < 0, "Suppressed_Down",
+    ifelse(sign(g1_fc) != sign(g2_fc), "Opposite_Direction",
+           "Other"))))))
+  
+  # Summary
+  vcat(sprintf("    Temporal changes:\n"))
+  vcat(sprintf("      %s: up=%d, down=%d, stable=%d\n",
+              compare_groups[1],
+              sum(g1_fc > 0.5, na.rm=TRUE),
+              sum(g1_fc < -0.5, na.rm=TRUE),
+              sum(abs(g1_fc) <= 0.5, na.rm=TRUE)))
+  vcat(sprintf("      %s: up=%d, down=%d, stable=%d\n",
+              compare_groups[2],
+              sum(g2_fc > 0.5, na.rm=TRUE),
+              sum(g2_fc < -0.5, na.rm=TRUE),
+              sum(abs(g2_fc) <= 0.5, na.rm=TRUE)))
+  vcat(sprintf("    Interaction patterns:\n"))
+  pattern_table <- table(results_df$Interaction_Pattern)
+  for (pattern in names(pattern_table)) {
+    vcat(sprintf("      %s: %d genes\n", pattern, pattern_table[pattern]))
+  }
+  
+  return(results_df)
 }
 
 ################################################################################
