@@ -53,6 +53,7 @@ Optional:
   --n-clusters INT            Number of clusters [default: 6]
   --run-enrichment            Enable pathway enrichment
   --enrichment-db STRING      Enrichment database: reactome, gobp, or gmt [default: reactome]
+  --gmt-file FILE             Path to GMT file (required when --enrichment-db gmt)
   --organism STRING           Organism: human or mouse [default: human]
   --verbose                   Verbose output
   --help                      Show this help message
@@ -72,6 +73,12 @@ Examples:
      --cluster-genes --n-clusters 6 \\
      --run-enrichment --enrichment-db reactome --organism human
 
+  # With custom GMT file enrichment
+  $0 --counts counts.txt --design design.txt \\
+     --interactions "WT-KO" \\
+     --run-enrichment --enrichment-db gmt \\
+     --gmt-file hallmark.gmt --organism mouse
+
 EOF
     exit 0
 }
@@ -84,6 +91,7 @@ ENRICHMENT_DB="reactome"
 ORGANISM="human"
 TOP_GENES="50"
 DUPLICATE_GENES=""
+GMT_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -107,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --n-clusters) N_CLUSTERS="$2"; shift 2 ;;
         --run-enrichment) ENRICHMENT="--run-enrichment"; shift ;;
         --enrichment-db) ENRICHMENT_DB="$2"; shift 2 ;;
+        --gmt-file) GMT_FILE="$2"; shift 2 ;;
         --organism) ORGANISM="$2"; shift 2 ;;
         --verbose) VERBOSE="--verbose"; shift ;;
         *) echo "Unknown option: $1"; show_help ;;
@@ -156,6 +165,9 @@ fi
 
 if [[ -n "$ENRICHMENT" ]]; then
     COMMON_OPTS="$COMMON_OPTS $ENRICHMENT --enrichment-db $ENRICHMENT_DB --organism $ORGANISM"
+    if [[ -n "$GMT_FILE" ]]; then
+        COMMON_OPTS="$COMMON_OPTS --gmt-file $GMT_FILE"
+    fi
 fi
 
 # Function to run a single group analysis
@@ -212,6 +224,9 @@ run_group() {
     
     if [[ -n "$ENRICHMENT" ]]; then
         CMD="$CMD $ENRICHMENT --enrichment-db $ENRICHMENT_DB --organism $ORGANISM"
+        if [[ -n "$GMT_FILE" ]]; then
+            CMD="$CMD --gmt-file $GMT_FILE"
+        fi
     fi
     
     CMD="$CMD --output-dir $output_dir"
@@ -289,6 +304,9 @@ run_interaction() {
     
     if [[ -n "$ENRICHMENT" ]]; then
         CMD="$CMD $ENRICHMENT --enrichment-db $ENRICHMENT_DB --organism $ORGANISM"
+        if [[ -n "$GMT_FILE" ]]; then
+            CMD="$CMD --gmt-file $GMT_FILE"
+        fi
     fi
     
     CMD="$CMD --output-dir $output_dir"
