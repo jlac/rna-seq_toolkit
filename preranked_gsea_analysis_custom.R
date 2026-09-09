@@ -9,7 +9,10 @@ library(clusterProfiler, quietly = TRUE, warn.conflicts = FALSE)
 library(enrichplot, quietly = TRUE, warn.conflicts = FALSE)
 library(ggplot2, quietly = TRUE, warn.conflicts = FALSE)
 library(DOSE, quietly = TRUE, warn.conflicts = FALSE)
-library(ComplexUpset, quietly = TRUE, warn.conflicts = FALSE)
+if (!requireNamespace("patchwork", quietly = TRUE)) {
+  stop("The 'patchwork' package is required for upset plots. Install with: install.packages('patchwork')")
+}
+library(patchwork, quietly = TRUE, warn.conflicts = FALSE)
 library(ReactomePA, quietly = TRUE, warn.conflicts = FALSE)
 library(plotly, quietly = TRUE, warn.conflicts = FALSE)
 library(htmltools, quietly = TRUE, warn.conflicts = FALSE)
@@ -280,12 +283,14 @@ perform_gsea <- function(de_file,
       tryCatch({
         # pairwise_termsim is needed for treeplot
         gsea_results_sim <- pairwise_termsim(gsea_results)
-        p4 <- treeplot(gsea_results_sim, showCategory = 40, color = "NES", size = "p.adjust") +
+        # NOTE: enrichplot >= 1.30 dropped the `size` argument from treeplot();
+        # point size is taken from setSize automatically.
+        p4 <- tryCatch(
+          treeplot(gsea_results_sim, showCategory = 40, color = "NES"),
+          error = function(e) treeplot(gsea_results_sim, showCategory = 40)
+        )
+        p4 <- p4 +
           scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "NES") +
-          scale_size_continuous(trans = "reverse", 
-                               range = c(2, 10),
-                               name = "-log10(FDR)",
-                               labels = function(x) sprintf("%.1f", -log10(x))) +
           ggtitle(paste(pathway_database, "GSEA Tree Plot -", base_name))
         ggsave(file.path(output_dir, paste0(base_name, "_gsea_treeplot.pdf")), 
                p4, width = 12, height = 10)
@@ -615,8 +620,119 @@ create_comparative_dotplots <- function(results_list, file_names, output_dir, pa
   })
 }
 
-# ComplexUpset-based upset plot function
-# Replace the create_upset_plot function in preranked_gsea_analysis.R with this
+# Build an UpSet-style figure using only plain ggplot2 layers + patchwork.
+# This avoids ComplexUpset (incompatible with ggplot2's S7 theme system) and
+# UpSetR (grid-based, does not return a saveable object).
+build_upset_ggplot <- function(pathway_sets, plot_title, bar_color = "#E74C3C",
+                               max_intersections = 40) {
+
+  set_names <- names(pathway_sets)
+  all_elements <- unique(unlist(pathway_sets))
+
+  # Binary membership matrix: elements x sets
+  membership <- vapply(set_names,
+                       function(s) all_elements %in% pathway_sets[[s]],
+                       logical(length(all_elements)))
+  membership <- matrix(membership, nrow = length(all_elements),
+                       dimnames = list(all_elements, set_names))
+
+  # Collapse each element to its membership pattern, then count patterns
+  patterns <- apply(membership, 1, function(r) paste(as.integer(r), collapse = ""))
+  empty_pattern <- paste(rep("0", length(set_names)), collapse = "")
+  counts <- sort(table(patterns), decreasing = TRUE)
+  counts <- counts[names(counts) != empty_pattern]
+
+  if (length(counts) == 0) {
+    stop("No non-empty intersections to plot")
+  }
+  if (length(counts) > max_intersections) {
+    counts <- counts[seq_len(max_intersections)]
+  }
+
+  intersection_ids <- names(counts)
+
+  # Y axis labels carry the set size so no separate side panel is needed
+  set_labels <- paste0(set_names, "  (n=", vapply(pathway_sets, length, integer(1)), ")")
+  names(set_labels) <- set_names
+  y_levels <- rev(unname(set_labels))
+
+  # Top panel: intersection sizes
+  bar_df <- data.frame(
+    intersection = factor(intersection_ids, levels = intersection_ids),
+    size = as.integer(counts),
+    stringsAsFactors = FALSE
+  )
+
+  # Bottom panel: the dot matrix
+  matrix_df <- do.call(rbind, lapply(intersection_ids, function(p) {
+    bits <- as.integer(strsplit(p, "")[[1]])
+    data.frame(
+      intersection = p,
+      set = unname(set_labels[set_names]),
+      member = bits == 1,
+      stringsAsFactors = FALSE
+    )
+  }))
+  matrix_df$intersection <- factor(matrix_df$intersection, levels = intersection_ids)
+  matrix_df$set <- factor(matrix_df$set, levels = y_levels)
+
+  # Connecting lines for intersections spanning 2+ sets
+  segment_rows <- lapply(intersection_ids, function(p) {
+    bits <- as.integer(strsplit(p, "")[[1]])
+    idx <- which(bits == 1)
+    if (length(idx) < 2) return(NULL)
+    positions <- match(unname(set_labels[set_names[idx]]), y_levels)
+    data.frame(
+      intersection = p,
+      y = y_levels[min(positions)],
+      yend = y_levels[max(positions)],
+      stringsAsFactors = FALSE
+    )
+  })
+  segment_df <- do.call(rbind, segment_rows)
+
+  p_top <- ggplot(bar_df, aes(x = intersection, y = size)) +
+    geom_col(fill = bar_color, width = 0.7) +
+    geom_text(aes(label = size), vjust = -0.4, size = 3) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+    labs(title = plot_title, x = NULL, y = "Intersection size") +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+
+  p_matrix <- ggplot(matrix_df, aes(x = intersection, y = set))
+
+  if (!is.null(segment_df)) {
+    segment_df$intersection <- factor(segment_df$intersection, levels = intersection_ids)
+    segment_df$y <- factor(segment_df$y, levels = y_levels)
+    segment_df$yend <- factor(segment_df$yend, levels = y_levels)
+    p_matrix <- p_matrix +
+      geom_segment(data = segment_df,
+                   aes(x = intersection, xend = intersection, y = y, yend = yend),
+                   inherit.aes = FALSE, linewidth = 0.9, color = "black")
+  }
+
+  p_matrix <- p_matrix +
+    geom_point(aes(color = member), size = 3.5) +
+    scale_color_manual(values = c("TRUE" = "black", "FALSE" = "grey85"), guide = "none") +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(size = 10)
+    )
+
+  n_sets <- length(set_names)
+  combined <- p_top / p_matrix + plot_layout(heights = c(3, max(1, n_sets * 0.45)))
+
+  list(plot = combined, n_sets = n_sets, n_intersections = length(intersection_ids))
+}
 
 create_upset_plot <- function(results_list, file_names, output_dir, padj_cutoff) {
   
@@ -649,44 +765,20 @@ create_upset_plot <- function(results_list, file_names, output_dir, padj_cutoff)
   # UPREGULATED PATHWAYS UPSET PLOT
   if (length(pathway_sets_up) >= 2) {
     tryCatch({
-      message(paste("Creating ComplexUpset plot with", length(unique(unlist(pathway_sets_up))), "upregulated pathways"))
+      message(paste("Creating upset plot with", length(unique(unlist(pathway_sets_up))), "upregulated pathways"))
       
-      all_pathways_up <- unique(unlist(pathway_sets_up))
-      upset_data <- data.frame(Pathway = all_pathways_up, stringsAsFactors = FALSE)
+      built <- build_upset_ggplot(pathway_sets_up,
+                                  plot_title = "Upregulated Pathways Overlap",
+                                  bar_color = "#E74C3C")
       
-      # Use actual comparison names
-      comp_names <- names(pathway_sets_up)
-      for (i in seq_along(pathway_sets_up)) {
-        upset_data[[comp_names[i]]] <- upset_data$Pathway %in% pathway_sets_up[[i]]
-      }
+      plot_height <- 4 + built$n_sets * 0.5
+      ggsave(file.path(output_dir, "upset_plot_upregulated_pathways.pdf"),
+             built$plot, width = 14, height = plot_height, device = "pdf", limitsize = FALSE)
+      ggsave(file.path(output_dir, "upset_plot_upregulated_pathways.png"),
+             built$plot, width = 14, height = plot_height, dpi = 200, device = "png", limitsize = FALSE)
       
-      message("ComplexUpset data structure:")
-      print(head(upset_data))
-      
-      p <- upset(
-        upset_data,
-        intersect = comp_names,
-        name = "Pathway Overlap",
-        width_ratio = 0.1,
-        min_size = 0,
-        sort_sets = FALSE,
-        sort_intersections_by = "cardinality",
-        base_annotations = list(
-          'Intersection size' = intersection_size(text = list(size = 3))
-        ),
-        set_sizes = (
-          upset_set_size()
-          + geom_text(aes(label = ..count..), hjust = 1.1, stat = "count", size = 3.5)
-          + theme(axis.text.x = element_text(angle = 90))
-        ),
-        themes = upset_default_themes(text = element_text(size = 9))
-      ) + ggtitle("Upregulated Pathways Overlap") +
-        theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
-      
-      ggsave(file.path(output_dir, "upset_plot_upregulated_pathways.pdf"), p, width = 16, height = 8, device = "pdf")
-      ggsave(file.path(output_dir, "upset_plot_upregulated_pathways.png"), p, width = 16, height = 8, dpi = 300, device = "png")
-      
-      message("Upregulated upset plot completed successfully")
+      message(paste("Upregulated upset plot completed successfully (",
+                    built$n_intersections, "intersections shown )"))
       
     }, error = function(e) {
       message(paste("ERROR creating upregulated upset plot:", e$message))
@@ -699,41 +791,20 @@ create_upset_plot <- function(results_list, file_names, output_dir, padj_cutoff)
   # DOWNREGULATED PATHWAYS UPSET PLOT
   if (length(pathway_sets_down) >= 2) {
     tryCatch({
-      message(paste("Creating ComplexUpset plot with", length(unique(unlist(pathway_sets_down))), "downregulated pathways"))
+      message(paste("Creating upset plot with", length(unique(unlist(pathway_sets_down))), "downregulated pathways"))
       
-      all_pathways_down <- unique(unlist(pathway_sets_down))
-      upset_data <- data.frame(Pathway = all_pathways_down, stringsAsFactors = FALSE)
+      built <- build_upset_ggplot(pathway_sets_down,
+                                  plot_title = "Downregulated Pathways Overlap",
+                                  bar_color = "#3498DB")
       
-      # Use actual comparison names
-      comp_names <- names(pathway_sets_down)
-      for (i in seq_along(pathway_sets_down)) {
-        upset_data[[comp_names[i]]] <- upset_data$Pathway %in% pathway_sets_down[[i]]
-      }
+      plot_height <- 4 + built$n_sets * 0.5
+      ggsave(file.path(output_dir, "upset_plot_downregulated_pathways.pdf"),
+             built$plot, width = 14, height = plot_height, device = "pdf", limitsize = FALSE)
+      ggsave(file.path(output_dir, "upset_plot_downregulated_pathways.png"),
+             built$plot, width = 14, height = plot_height, dpi = 200, device = "png", limitsize = FALSE)
       
-      p <- upset(
-        upset_data,
-        intersect = comp_names,
-        name = "Pathway Overlap",
-        width_ratio = 0.1,
-        min_size = 0,
-        sort_sets = FALSE,
-        sort_intersections_by = "cardinality",
-        base_annotations = list(
-          'Intersection size' = intersection_size(text = list(size = 3))
-        ),
-        set_sizes = (
-          upset_set_size()
-          + geom_text(aes(label = ..count..), hjust = 1.1, stat = "count", size = 3.5)
-          + theme(axis.text.x = element_text(angle = 90))
-        ),
-        themes = upset_default_themes(text = element_text(size = 9))
-      ) + ggtitle("Downregulated Pathways Overlap") +
-        theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
-      
-      ggsave(file.path(output_dir, "upset_plot_downregulated_pathways.pdf"), p, width = 16, height = 8, device = "pdf")
-      ggsave(file.path(output_dir, "upset_plot_downregulated_pathways.png"), p, width = 16, height = 8, dpi = 300, device = "png")
-      
-      message("Downregulated upset plot completed successfully")
+      message(paste("Downregulated upset plot completed successfully (",
+                    built$n_intersections, "intersections shown )"))
       
     }, error = function(e) {
       message(paste("ERROR creating downregulated upset plot:", e$message))
