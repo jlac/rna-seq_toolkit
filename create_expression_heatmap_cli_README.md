@@ -144,13 +144,61 @@ The default drops your `Ignore` samples. To keep everything:
 | `-g`, `--gene_list` | list | none | Specific genes, comma-separated. Overrides `-n`. |
 | `--gene_file` | file | none | Specific genes, one per line. Overrides `-n` and `-g`. |
 
-Precedence: `--gene_file` > `-g` > `-n`.
+Precedence: `--gene_file` > `-g` > DE-based selection (next section) > `-n`.
 
 Genes in your list that aren't in the matrix produce a warning naming the first 10 and are skipped; the plot still gets made from the rest.
 
 **Violin and boxplot require an explicit gene list.** `-n` is rejected in those modes — a violin panel per gene only makes sense for a handful of named genes.
 
 **How top-variable genes are chosen:** variance is computed on the values *as supplied*, before `-t` is applied. On TPM data that means selection is driven by absolute magnitude, so highly-expressed genes dominate. If you want variance ranked on the log scale instead, pre-log your input matrix and run with `-t none`.
+
+---
+
+### DE-based gene selection — heatmap, violin, boxplot
+
+Pick genes by significance from a DE results table instead of by variance or by hand. Requires `--de_file` alongside the usual `-e` and `-d`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--top_de_genes` | integer | none | Take top N up **and** top N down — up to 2N genes. |
+| `--top_up` | integer | none | Number of upregulated genes. Overrides `--top_de_genes`. |
+| `--top_down` | integer | none | Number of downregulated genes. Overrides `--top_de_genes`. |
+| `--de_rank_by` | choice | `pvalue` | Rank by `pvalue` (significance) or `lfc` (fold-change magnitude). |
+| `--de_apply_thresholds` | flag | off | Restrict to genes passing `--lfc_threshold` and `--pval_threshold` before ranking. |
+| `--de_order_rows` | flag | off | Order heatmap rows up-then-down by rank instead of clustering genes. |
+
+The typical call:
+
+```bash
+Rscript create_expression_heatmap_cli.R \
+  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
+  --de_file deseq2_results.txt --top_de_genes 50 \
+  --de_order_rows -o top50_heatmap.pdf
+```
+
+**Direction** comes from the sign of log2FC: positive is up, negative is down. Each direction is ranked separately, so you get 50 of each rather than 100 genes that might all point the same way.
+
+**Choosing p-value vs p.adj.** The same auto-detection used by volcano mode applies, and it prefers adjusted p-values. To rank on the raw p-value instead, name the column:
+
+```bash
+--de_pval_col pvalue     # DESeq2 raw
+--de_pval_col PValue     # edgeR raw
+--de_pval_col P.Value    # limma raw
+```
+
+The script prints which column it used — check that line.
+
+**Ties** are common in adjusted p-values, where many genes can share a value. They're broken by fold-change magnitude so the selection is deterministic rather than dependent on row order in your file.
+
+**`--de_apply_thresholds` is off by default.** Without it you get the top N per direction regardless of whether they're significant, which is usually what you want for an exploratory "top 50" heatmap. The script reports how many of the selected genes would pass the thresholds, so you can see when a request for 50 has scraped past the significant ones. Turn the flag on to require significance — and then a request for 50 may return fewer, which is also reported.
+
+**Gene ID matching.** DE genes not present in the expression matrix are dropped before ranking, so the reported counts reflect what can actually be drawn. If nothing matches at all, the script stops with a message about ID types — usually symbols in one file and Ensembl IDs in the other.
+
+**`--de_order_rows`** turns off row clustering, orders rows by rank (most significant first within each block), and splits the heatmap into labeled Up and Down sections. Use it when the direction of change is the point. Leave it off to cluster genes normally, which can reveal that the "up" genes aren't all behaving alike across samples.
+
+Genes can still disappear after selection if `-s zscore` finds them to have zero variance across your chosen samples, so a request for 100 may draw slightly fewer. That count is reported too.
+
+**Precedence:** `--gene_file` > `-g` > `--top_de_genes`/`--top_up`/`--top_down` > `-n`. If you pass both an explicit gene list and DE selection, the script says which one it used rather than silently picking.
 
 ---
 
@@ -253,7 +301,7 @@ Turning off column clustering keeps samples in design-file order, which is often
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--de_file` | file | none | **Required.** DE results table. |
+| `--de_file` | file | none | **Required for volcano.** DE results table. Also used by DE-based gene selection in the other plot types. |
 | `--de_gene_col` | column | auto | Gene ID column. |
 | `--de_lfc_col` | column | auto | log2 fold-change column. |
 | `--de_pval_col` | column | auto | P-value column. |
@@ -360,6 +408,18 @@ Zero-variance genes reaching the scaling step. Use `-t log2` (recommended), or `
 **`None of the specified genes found in expression data!`**
 ID namespace mismatch — check whether your list uses symbols and the matrix uses Ensembl IDs, or vice versa. Compare: `head -3 Reformat_TPMCountFile_rsemgenes.txt | cut -f1` against `head -3 your_genes.txt`.
 
+**`No genes in the DE table match the expression matrix`**
+Gene ID namespace mismatch between `--de_file` and `-e`. Compare `cut -f1 deseq2_results.txt | head -3` against `cut -f1 Reformat_TPMCountFile_rsemgenes.txt | head -3`.
+
+**`DE-based gene selection requires a DE results table`**
+`--top_de_genes` was passed without `--de_file`.
+
+**`No genes pass the thresholds`**
+`--de_apply_thresholds` with cutoffs nothing meets. Loosen `--lfc_threshold` / `--pval_threshold`, or drop the flag and rank without filtering.
+
+**Fewer genes than requested from `--top_de_genes`**
+Either that direction has fewer genes available, or `-s zscore` dropped zero-variance genes afterward. Both are reported in the output.
+
 **`Could not auto-detect the ... column`**
 Name it explicitly with `--de_gene_col` / `--de_lfc_col` / `--de_pval_col`. The error message lists the columns actually present in your file.
 
@@ -388,6 +448,26 @@ Rscript create_expression_heatmap_cli.R \
   -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   -f Group -v "Filaria-neg_CMV_Pop-POS,Filaria-POS_CMV_Pop-POS" \
   -n 1000 -a Group -o cmv_comparison.pdf --save_matrix
+
+# Top 50 up and 50 down by padj, split into Up/Down blocks
+Rscript create_expression_heatmap_cli.R \
+  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
+  --de_file deseq2_results.txt --top_de_genes 50 \
+  --de_order_rows --show_row_names --row_fontsize 5 \
+  -a Pop -o top50_updown.pdf --save_matrix
+
+# Top 25 each way ranked on raw p-value, clustered normally
+Rscript create_expression_heatmap_cli.R \
+  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
+  --de_file deseq2_results.txt --top_de_genes 25 \
+  --de_pval_col pvalue -o top25_raw_p.pdf
+
+# Top 30 up only, requiring significance, as a violin plot
+Rscript create_expression_heatmap_cli.R \
+  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
+  --de_file deseq2_results.txt --top_up 30 --top_down 0 \
+  --de_apply_thresholds --plot_type violin --group_by Pop \
+  --add_points --height 6 -o top_up_violin.pdf
 
 # DEG list, gene names shown, keeping design order
 Rscript create_expression_heatmap_cli.R \
