@@ -112,6 +112,20 @@ option_list <- list(
   make_option(c("--gene_file"), type="character", default=NULL,
               help="File with gene list (one per line, overrides -n and -g)"),
   
+  # DE-based Gene Selection (heatmap/violin/boxplot, requires --de_file)
+  make_option(c("--top_de_genes"), type="integer", default=NULL,
+              help="Select top N up AND top N down genes from --de_file (gives up to 2N genes)"),
+  make_option(c("--top_up"), type="integer", default=NULL,
+              help="Number of upregulated genes to select (overrides --top_de_genes)"),
+  make_option(c("--top_down"), type="integer", default=NULL,
+              help="Number of downregulated genes to select (overrides --top_de_genes)"),
+  make_option(c("--de_rank_by"), type="character", default="pvalue",
+              help="Rank DE genes by: pvalue or lfc [default: %default]"),
+  make_option(c("--de_apply_thresholds"), action="store_true", default=FALSE,
+              help="Only consider genes passing --lfc_threshold and --pval_threshold before ranking"),
+  make_option(c("--de_order_rows"), action="store_true", default=FALSE,
+              help="Order heatmap rows up-then-down by rank instead of clustering genes"),
+  
   # Expression Transformation
   make_option(c("-t", "--transform"), type="character", default="log2",
               help="Expression transformation: log2, log10, zscore, none [default: %default]"),
@@ -190,6 +204,15 @@ opt_parser <- OptionParser(
     "  Rscript create_expression_heatmap_cli.R -n 1000 --save_matrix -o my_heatmap.pdf",
     "  # Creates: my_heatmap.pdf and my_heatmap_matrix.txt",
     "",
+    "  # Heatmap of the top 50 up and top 50 down genes from a DE table",
+    "  Rscript create_expression_heatmap_cli.R --de_file deseq2_results.txt --top_de_genes 50 --de_order_rows -o top_de_heatmap.pdf",
+    "",
+    "  # Rank by raw p-value instead of padj, 25 each direction",
+    "  Rscript create_expression_heatmap_cli.R --de_file results.txt --top_de_genes 25 --de_pval_col pvalue -o top25.pdf",
+    "",
+    "  # Only upregulated genes, restricted to significant ones",
+    "  Rscript create_expression_heatmap_cli.R --de_file results.txt --top_up 40 --top_down 0 --de_apply_thresholds -o top_up.pdf",
+    "",
     "  # Volcano plot highlighting specific genes",
     "  Rscript create_expression_heatmap_cli.R --plot_type volcano --de_file deseq2_results.txt --highlight_genes \"IFNG,IL6,TNF\" -o volcano.pdf",
     "",
@@ -246,33 +269,30 @@ cat("Expression Heatmap Generator\n")
 cat("============================\n\n")
 
 ################################################################################
-# VOLCANO PLOT
+# DE TABLE LOADER
 #
-# Volcano plots are built from a differential expression results table, not
-# from the expression matrix, so this branch runs on its own and exits when
-# finished. The expression matrix and design file are not required.
+# Shared by volcano plots and by DE-based gene selection (--top_de_genes), so
+# both use identical column detection and NA handling.
+#
+# Returns a list with:
+#   $data     data.frame of gene, log2FC, pvalue (NA rows removed)
+#   $adjusted TRUE if the p-value column is an adjusted/FDR column
+#   $pval_col name of the p-value column that was used
 ################################################################################
 
-if (opt$plot_type == "volcano") {
+load_de_table <- function(de_path) {
   
-  if (is.null(opt$de_file)) {
-    stop("Volcano plots require a DE results table. Use --de_file.")
-  }
-  if (!file.exists(opt$de_file)) {
-    stop(sprintf("DE results file not found: %s", opt$de_file))
+  if (!file.exists(de_path)) {
+    stop(sprintf("DE results file not found: %s", de_path))
   }
   
-  ##############################################################################
-  # Load DE results
-  ##############################################################################
-  
-  cat(sprintf("Loading DE results from %s...\n", opt$de_file))
+  cat(sprintf("Loading DE results from %s...\n", de_path))
   
   # Sniff the delimiter so .csv and .tsv/.txt both work
-  first_line <- readLines(opt$de_file, n = 1)
+  first_line <- readLines(de_path, n = 1)
   de_sep <- if (grepl(",", first_line) && !grepl("\t", first_line)) "," else "\t"
   
-  de <- read.table(opt$de_file,
+  de <- read.table(de_path,
                    header = TRUE,
                    sep = de_sep,
                    check.names = FALSE,
@@ -282,9 +302,7 @@ if (opt$plot_type == "volcano") {
   
   vcat(sprintf("  Columns found: %s\n", paste(colnames(de), collapse = ", ")))
   
-  ##############################################################################
-  # Identify the gene, log2FC, and p-value columns
-  ##############################################################################
+  # ---- Identify the gene, log2FC, and p-value columns ----
   
   pick_column <- function(user_choice, candidates, what, fallback = NULL) {
     if (!is.null(user_choice)) {
@@ -327,36 +345,61 @@ if (opt$plot_type == "volcano") {
   cat(sprintf("  log2FC column:   %s\n", lfc_col_name))
   cat(sprintf("  P-value column:  %s\n", pval_col_name))
   
-  # Note whether we ended up on an adjusted or raw p-value, for the axis label
-  adjusted_pval <- tolower(pval_col_name) %in%
+  # Note whether this is an adjusted or raw p-value, for axis labels and reporting
+  is_adjusted <- tolower(pval_col_name) %in%
     tolower(c("padj", "FDR", "adj.P.Val", "qvalue", "q_value", "adj_pvalue", "p_adj"))
   
-  ##############################################################################
-  # Build the plotting data frame
-  ##############################################################################
+  # ---- Build the standardized data frame ----
   
-  volcano_data <- data.frame(
+  out <- data.frame(
     gene = as.character(de[[gene_col_name]]),
     log2FC = suppressWarnings(as.numeric(de[[lfc_col_name]])),
     pvalue = suppressWarnings(as.numeric(de[[pval_col_name]])),
     stringsAsFactors = FALSE
   )
   
-  n_start <- nrow(volcano_data)
+  n_start <- nrow(out)
   
   # Drop rows with missing values. In DESeq2 output, NA padj means the gene was
   # filtered out by independent filtering or flagged as an outlier, so these
-  # rows carry no significance call and cannot be placed on the y-axis.
-  volcano_data <- volcano_data[!is.na(volcano_data$log2FC) &
-                                 !is.na(volcano_data$pvalue), ]
-  n_dropped <- n_start - nrow(volcano_data)
+  # rows carry no significance call and cannot be ranked or plotted.
+  out <- out[!is.na(out$log2FC) & !is.na(out$pvalue), ]
+  n_dropped <- n_start - nrow(out)
   if (n_dropped > 0) {
     cat(sprintf("  Dropped %d genes with NA log2FC or p-value\n", n_dropped))
   }
   
-  if (nrow(volcano_data) == 0) {
+  if (nrow(out) == 0) {
     stop("No genes remain after removing NA values. Check the column selections.")
   }
+  
+  list(data = out, adjusted = is_adjusted, pval_col = pval_col_name)
+}
+
+################################################################################
+# VOLCANO PLOT
+#
+# Volcano plots are built from a differential expression results table, not
+# from the expression matrix, so this branch runs on its own and exits when
+# finished. The expression matrix and design file are not required.
+################################################################################
+
+if (opt$plot_type == "volcano") {
+  
+  if (is.null(opt$de_file)) {
+    stop("Volcano plots require a DE results table. Use --de_file.")
+  }
+  if (!file.exists(opt$de_file)) {
+    stop(sprintf("DE results file not found: %s", opt$de_file))
+  }
+  
+  ##############################################################################
+  # Load DE results
+  ##############################################################################
+  
+  de_loaded <- load_de_table(opt$de_file)
+  volcano_data <- de_loaded$data
+  adjusted_pval <- de_loaded$adjusted
   
   # P-values of exactly zero become Inf after -log10. Floor them at the smallest
   # nonzero p-value in the table so those genes stay on the plot; note it, since
@@ -632,20 +675,55 @@ if (tolower(opt$filter_column) == "none") {
 }
 
 # Process gene selection
+# Precedence: --gene_file > -g > --top_de_genes/--top_up/--top_down > -n
+use_top_variable <- FALSE
+use_de_selection <- FALSE
+gene_list <- NULL
+
+# Resolve the requested up/down counts
+n_up   <- if (!is.null(opt$top_up))   opt$top_up   else opt$top_de_genes
+n_down <- if (!is.null(opt$top_down)) opt$top_down else opt$top_de_genes
+de_selection_requested <- !is.null(n_up) || !is.null(n_down)
+if (de_selection_requested) {
+  if (is.null(n_up))   n_up   <- 0
+  if (is.null(n_down)) n_down <- 0
+  if (n_up < 0 || n_down < 0) {
+    stop("--top_de_genes / --top_up / --top_down must not be negative")
+  }
+  if (n_up == 0 && n_down == 0) {
+    stop("--top_up and --top_down are both 0; nothing to select")
+  }
+}
+
 if (!is.null(opt$gene_file)) {
   # Gene list from file
   gene_list <- readLines(opt$gene_file)
   gene_list <- trimws(gene_list)
   gene_list <- gene_list[nchar(gene_list) > 0]  # Remove empty lines
-  use_top_variable <- FALSE
   vcat(sprintf("Gene selection: %d genes from file %s\n", 
               length(gene_list), opt$gene_file))
+  if (de_selection_requested) {
+    cat("  NOTE: --gene_file takes precedence; ignoring DE-based gene selection\n")
+  }
 } else if (!is.null(opt$gene_list)) {
   # Gene list from command line
   gene_list <- strsplit(opt$gene_list, ",")[[1]]
   gene_list <- trimws(gene_list)
-  use_top_variable <- FALSE
   vcat(sprintf("Gene selection: %d genes from command line\n", length(gene_list)))
+  if (de_selection_requested) {
+    cat("  NOTE: -g takes precedence; ignoring DE-based gene selection\n")
+  }
+} else if (de_selection_requested) {
+  # Top up/down genes from a DE results table
+  if (is.null(opt$de_file)) {
+    stop("DE-based gene selection requires a DE results table. Use --de_file.")
+  }
+  if (!tolower(opt$de_rank_by) %in% c("pvalue", "lfc")) {
+    stop(sprintf("--de_rank_by must be 'pvalue' or 'lfc', got '%s'", opt$de_rank_by))
+  }
+  use_de_selection <- TRUE
+  vcat(sprintf("Gene selection: top %d up / %d down from %s, ranked by %s\n",
+              n_up, n_down, opt$de_file, tolower(opt$de_rank_by)))
 } else {
   # Top variable genes
   use_top_variable <- TRUE
@@ -785,11 +863,100 @@ design <- design[match(common_samples, design$Sample), ]
 
 cat("Selecting genes...\n")
 
+de_row_order <- NULL   # set by DE selection, used by --de_order_rows
+
 if (use_top_variable) {
   gene_vars <- apply(expr_data, 1, var, na.rm = TRUE)
   top_genes <- names(sort(gene_vars, decreasing = TRUE)[1:min(opt$n_genes, length(gene_vars))])
   expr_matrix <- expr_data[top_genes, , drop = FALSE]
   cat(sprintf("  Selected %d most variable genes\n", nrow(expr_matrix)))
+  
+} else if (use_de_selection) {
+  
+  de_loaded <- load_de_table(opt$de_file)
+  de_tab <- de_loaded$data
+  rank_label <- if (de_loaded$adjusted) "adj. p" else "p"
+  
+  # Keep only DE genes that are actually present in the expression matrix, so
+  # the counts reported below reflect what can really be drawn
+  n_before <- nrow(de_tab)
+  de_tab <- de_tab[de_tab$gene %in% rownames(expr_data), ]
+  if (nrow(de_tab) == 0) {
+    stop(paste("No genes in the DE table match the expression matrix.",
+               "Check that both use the same gene ID type (symbols vs Ensembl IDs)."))
+  }
+  if (nrow(de_tab) < n_before) {
+    cat(sprintf("  %d of %d DE genes found in the expression matrix\n",
+               nrow(de_tab), n_before))
+  }
+  
+  # Optionally restrict to genes passing the significance thresholds
+  if (opt$de_apply_thresholds) {
+    n_pre <- nrow(de_tab)
+    de_tab <- de_tab[de_tab$pvalue < opt$pval_threshold &
+                       abs(de_tab$log2FC) >= opt$lfc_threshold, ]
+    cat(sprintf("  %d of %d genes pass |log2FC| >= %.2g and %s < %.2g\n",
+               nrow(de_tab), n_pre, opt$lfc_threshold, rank_label, opt$pval_threshold))
+    if (nrow(de_tab) == 0) {
+      stop("No genes pass the thresholds. Loosen --lfc_threshold / --pval_threshold, or drop --de_apply_thresholds.")
+    }
+  }
+  
+  up_pool   <- de_tab[de_tab$log2FC > 0, ]
+  down_pool <- de_tab[de_tab$log2FC < 0, ]
+  
+  # Rank within each direction. Ties in p-value are common in DE output
+  # (especially with adjusted p-values, where many genes share a value), so
+  # break them by fold-change magnitude to make the selection deterministic.
+  rank_pool <- function(pool) {
+    if (nrow(pool) == 0) return(pool)
+    if (tolower(opt$de_rank_by) == "lfc") {
+      pool[order(-abs(pool$log2FC), pool$pvalue), ]
+    } else {
+      pool[order(pool$pvalue, -abs(pool$log2FC)), ]
+    }
+  }
+  
+  up_sel   <- head(rank_pool(up_pool),   n_up)
+  down_sel <- head(rank_pool(down_pool), n_down)
+  
+  # Warn when a pool could not supply as many genes as requested
+  if (n_up > 0 && nrow(up_sel) < n_up) {
+    cat(sprintf("  WARNING: only %d upregulated genes available (%d requested)\n",
+               nrow(up_sel), n_up))
+  }
+  if (n_down > 0 && nrow(down_sel) < n_down) {
+    cat(sprintf("  WARNING: only %d downregulated genes available (%d requested)\n",
+               nrow(down_sel), n_down))
+  }
+  
+  selected <- rbind(up_sel, down_sel)
+  if (nrow(selected) == 0) {
+    stop("DE-based selection produced no genes.")
+  }
+  
+  expr_matrix <- expr_data[selected$gene, , drop = FALSE]
+  de_row_order <- selected$gene   # up first, then down, each in rank order
+  
+  cat(sprintf("  Selected %d genes: %d up, %d down (ranked by %s)\n",
+             nrow(expr_matrix), nrow(up_sel), nrow(down_sel),
+             if (tolower(opt$de_rank_by) == "lfc") "|log2FC|" else rank_label))
+  
+  # If thresholds were not applied, say how many of the chosen genes would
+  # actually pass them, since ranking alone does not guarantee significance
+  if (!opt$de_apply_thresholds) {
+    n_sig <- sum(selected$pvalue < opt$pval_threshold &
+                   abs(selected$log2FC) >= opt$lfc_threshold)
+    if (n_sig < nrow(selected)) {
+      cat(sprintf("  NOTE: %d of %d selected genes pass |log2FC| >= %.2g and %s < %.2g\n",
+                 n_sig, nrow(selected), opt$lfc_threshold,
+                 rank_label, opt$pval_threshold))
+    }
+  }
+  
+  vcat(sprintf("  Top up:   %s\n", paste(head(up_sel$gene, 5), collapse = ", ")))
+  vcat(sprintf("  Top down: %s\n", paste(head(down_sel$gene, 5), collapse = ", ")))
+  
 } else {
   available_genes <- intersect(gene_list, rownames(expr_data))
   
@@ -1178,6 +1345,26 @@ if (!is.null(opt$split_by)) {
 can_cluster_rows <- opt$cluster_rows
 can_cluster_cols <- opt$cluster_columns
 
+# Order rows by DE rank (up first, then down) instead of clustering them.
+# Restrict to rows still present: zero-variance genes may have been dropped
+# during scaling after selection.
+row_split <- NULL
+if (opt$de_order_rows) {
+  if (is.null(de_row_order)) {
+    warning("--de_order_rows has no effect without DE-based gene selection, ignoring")
+  } else {
+    kept <- de_row_order[de_row_order %in% rownames(expr_matrix)]
+    expr_matrix <- expr_matrix[kept, , drop = FALSE]
+    # Label each row's direction so the two blocks are visually separated
+    row_split <- factor(
+      ifelse(kept %in% up_sel$gene, "Up", "Down"),
+      levels = c("Up", "Down")
+    )
+    can_cluster_rows <- FALSE
+    cat("  Rows ordered by DE rank (up, then down); row clustering disabled\n")
+  }
+}
+
 if (can_cluster_rows && nrow(expr_matrix) < 2) {
   warning("Cannot cluster rows with less than 2 genes, disabling row clustering")
   can_cluster_rows <- FALSE
@@ -1206,8 +1393,9 @@ ht <- Heatmap(
   cluster_rows = can_cluster_rows,
   cluster_columns = can_cluster_cols,
   
-  # Column splitting
+  # Splitting
   column_split = column_split,
+  row_split = row_split,
   
   # Annotations
   top_annotation = ha,
