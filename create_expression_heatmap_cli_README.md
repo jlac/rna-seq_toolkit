@@ -69,19 +69,25 @@ Tab- or comma-delimited (auto-sniffed from the header line). Needs a gene ID col
 
 ## Quick start
 
+With the input files named `normalized_counts.txt` and `design.txt` in the working directory, `-e` and `-d` can be omitted.
+
 ```bash
 # See all options
 Rscript create_expression_heatmap_cli.R --help
 
-# Heatmap, top 1000 variable genes, PopNeg vs PopPos
+# Heatmap: top 1000 variable genes, all samples, no annotations
+Rscript create_expression_heatmap_cli.R -o heatmap.pdf
+
+# Same, but filtered to two groups with annotation bars
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt \
-  -d evitta_design.txt \
-  -o heatmap.pdf
+  -f Pop -v "PopNeg,PopPos" -a "BigGroup,Pop" -o heatmap.pdf
+
+# Different filenames
+Rscript create_expression_heatmap_cli.R \
+  -e my_counts.txt -d my_design.txt -o heatmap.pdf
 
 # Violin plot of specific genes
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --plot_type violin -g "IFNG,IL6,TNF" --group_by Pop -o violin.pdf
 
 # Volcano plot with highlighted genes (no -e or -d needed)
@@ -89,6 +95,8 @@ Rscript create_expression_heatmap_cli.R \
   --plot_type volcano --de_file deseq2_results.txt \
   --highlight_genes "IFNG,IL6,TNF" -o volcano.pdf
 ```
+
+**Defaults do nothing to your data.** Out of the box the script uses every sample, draws no annotation bars, and performs no averaging. Filtering, annotations, and averaging all have to be requested explicitly.
 
 **Quoting:** comma-separated lists go inside **one** set of quotes.
 `-v "A,B"` is correct. `-v "A","B"` is not — the shell splits that into two arguments and only the first reaches the script.
@@ -101,8 +109,8 @@ Rscript create_expression_heatmap_cli.R \
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `-e`, `--expression` | file | `Reformat_TPMCountFile_rsemgenes.txt` | Expression matrix. Not read in volcano mode. |
-| `-d`, `--design` | file | `evitta_design.txt` | Design/metadata file. Not read in volcano mode. |
+| `-e`, `--expression` | file | `normalized_counts.txt` | Expression matrix. Not read in volcano mode. |
+| `-d`, `--design` | file | `design.txt` | Design/metadata file. Not read in volcano mode. |
 | `-o`, `--output` | file | `expression_heatmap.pdf` | Output figure. Extension decides format: `.png` writes PNG, anything else writes PDF. |
 | `--save_matrix` | flag | off | Also write the data behind the figure to a text file. |
 | `--matrix_file` | file | `<output>_matrix.txt` | Custom path for the saved data. In volcano mode the default suffix is `_data.txt`. |
@@ -125,14 +133,18 @@ Rscript create_expression_heatmap_cli.R \
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `-f`, `--filter_column` | column | `Pop` | Design column to filter on. Pass `none` to keep all samples. |
-| `-v`, `--filter_values` | list | `PopNeg,PopPos` | Values in that column to keep. |
+| `-f`, `--filter_column` | column | none | Design column to filter on. Omit to keep all samples. |
+| `-v`, `--filter_values` | list | none | Values in that column to keep. |
 
-The default drops your `Ignore` samples. To keep everything:
+**No filtering happens unless you ask for it.** By default every sample in the design file is used.
+
+The two options go together. Passing `-f` without `-v` is an error, since there's no way to guess which values you meant:
 
 ```bash
--f none
+-f Pop -v "PopNeg,PopPos"     # keeps PopNeg and PopPos, drops Ignore
 ```
+
+Passing `-v` alone warns and does nothing. `-f none` is still accepted as an explicit way of saying "no filtering."
 
 ---
 
@@ -171,7 +183,6 @@ The typical call:
 
 ```bash
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --de_file deseq2_results.txt --top_de_genes 50 \
   --de_order_rows -o top50_heatmap.pdf
 ```
@@ -225,10 +236,16 @@ Two combinations to avoid:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `-a`, `--annotations` | list | `BigGroup,Pop` | Design columns to draw as colored bars above the heatmap. Pass `none` for no annotations. |
+| `-a`, `--annotations` | list | none | Design columns to draw as colored bars above the heatmap. |
 | `--annotation_fontsize` | number | `10` | Annotation label font size. |
 
-Colors are assigned automatically: ColorBrewer `Set2` for up to 8 levels, `Set3` for up to 12, `rainbow()` beyond that.
+**No annotation bars are drawn unless you ask for them.** Pass the columns you want:
+
+```bash
+-a "BigGroup,Pop"
+```
+
+Colors are assigned automatically: ColorBrewer `Set2` for up to 8 levels, `Set3` for up to 12, `rainbow()` beyond that. `-a none` is still accepted as an explicit "no annotations."
 
 ---
 
@@ -237,8 +254,16 @@ Colors are assigned automatically: ColorBrewer `Set2` for up to 8 levels, `Set3`
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `--average_groups` | flag | off | Collapse samples into one column per group. |
-| `--average_by` | column | `Group` | Design column defining the groups. |
+| `--average_by` | column | none | Design column defining the groups. **Required** with `--average_groups`. |
 | `--average_function` | choice | `mean` | `mean` or `median`. |
+
+`--average_groups` without `--average_by` is an error rather than a guess:
+
+```bash
+--average_groups --average_by BigGroup
+```
+
+`--average_by` on its own warns and does nothing.
 
 Averaging runs *after* transformation and scaling, so with the defaults you are averaging z-scores, not raw TPM.
 
@@ -406,10 +431,10 @@ An older version of the script. The current one handles duplicates via `--duplic
 Zero-variance genes reaching the scaling step. Use `-t log2` (recommended), or `-s none`, or disable clustering.
 
 **`None of the specified genes found in expression data!`**
-ID namespace mismatch — check whether your list uses symbols and the matrix uses Ensembl IDs, or vice versa. Compare: `head -3 Reformat_TPMCountFile_rsemgenes.txt | cut -f1` against `head -3 your_genes.txt`.
+ID namespace mismatch — check whether your list uses symbols and the matrix uses Ensembl IDs, or vice versa. Compare: `head -3 normalized_counts.txt | cut -f1` against `head -3 your_genes.txt`.
 
 **`No genes in the DE table match the expression matrix`**
-Gene ID namespace mismatch between `--de_file` and `-e`. Compare `cut -f1 deseq2_results.txt | head -3` against `cut -f1 Reformat_TPMCountFile_rsemgenes.txt | head -3`.
+Gene ID namespace mismatch between `--de_file` and `-e`. Compare `cut -f1 deseq2_results.txt | head -3` against `cut -f1 normalized_counts.txt | head -3`.
 
 **`DE-based gene selection requires a DE results table`**
 `--top_de_genes` was passed without `--de_file`.
@@ -427,10 +452,16 @@ Name it explicitly with `--de_gene_col` / `--de_lfc_col` / `--de_pval_col`. The 
 Use `-g` or `--gene_file`; `-n` isn't valid in those modes.
 
 **`Averaging column 'X' not found in design`** / **`Group column 'X' not found`**
-Check available columns: `head -1 evitta_design.txt`. Yours are `Sample`, `Group`, `BigGroup`, `Pop`.
+Check available columns: `head -1 design.txt`. Yours are `Sample`, `Group`, `BigGroup`, `Pop`.
 
 **Only one column after averaging**
 Every remaining sample falls in the same `--average_by` group. Either your `-f`/`-v` filter was too narrow, or you're averaging by a column that doesn't vary within the filtered set.
+
+**`-f/--filter_column '...' was given without -v/--filter_values`**
+Filtering needs both halves. Add `-v "value1,value2"`, or drop `-f` to keep all samples.
+
+**`--average_groups requires --average_by`**
+Name the column defining the groups, e.g. `--average_groups --average_by BigGroup`.
 
 **Volcano labels overlap**
 Install ggrepel: `install.packages("ggrepel")`.
@@ -445,45 +476,38 @@ The script reports how many highlight genes it matched. If it's zero, the IDs do
 ```bash
 # Filaria-neg vs Filaria-POS, CMV Pop-POS samples only
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   -f Group -v "Filaria-neg_CMV_Pop-POS,Filaria-POS_CMV_Pop-POS" \
   -n 1000 -a Group -o cmv_comparison.pdf --save_matrix
 
 # Top 50 up and 50 down by padj, split into Up/Down blocks
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --de_file deseq2_results.txt --top_de_genes 50 \
   --de_order_rows --show_row_names --row_fontsize 5 \
   -a Pop -o top50_updown.pdf --save_matrix
 
 # Top 25 each way ranked on raw p-value, clustered normally
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --de_file deseq2_results.txt --top_de_genes 25 \
   --de_pval_col pvalue -o top25_raw_p.pdf
 
 # Top 30 up only, requiring significance, as a violin plot
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --de_file deseq2_results.txt --top_up 30 --top_down 0 \
   --de_apply_thresholds --plot_type violin --group_by Pop \
   --add_points --height 6 -o top_up_violin.pdf
 
 # DEG list, gene names shown, keeping design order
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --gene_file deg_list.txt --show_row_names --row_fontsize 8 \
   --no_cluster_columns -o deg_heatmap.pdf
 
 # One column per treatment group, medians
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --average_groups --average_by BigGroup --average_function median \
   -n 1000 -a BigGroup -o averaged.pdf
 
 # Violin plot, two groups, points shown
 Rscript create_expression_heatmap_cli.R \
-  -e Reformat_TPMCountFile_rsemgenes.txt -d evitta_design.txt \
   --plot_type violin -g "IFNG,IL6,TNF,IL1B" \
   --group_by Pop -f Pop -v "PopNeg,PopPos" \
   --add_points --width 9 --height 6 -o violin.pdf
