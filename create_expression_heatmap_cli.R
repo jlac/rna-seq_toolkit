@@ -24,9 +24,9 @@ suppressPackageStartupMessages({
 
 option_list <- list(
   # Input/Output
-  make_option(c("-e", "--expression"), type="character", default="Reformat_TPMCountFile_rsemgenes.txt",
+  make_option(c("-e", "--expression"), type="character", default="normalized_counts.txt",
               help="Expression matrix file [default: %default]"),
-  make_option(c("-d", "--design"), type="character", default="evitta_design.txt",
+  make_option(c("-d", "--design"), type="character", default="design.txt",
               help="Design/metadata file [default: %default]"),
   # Output Options
   make_option(c("-o", "--output"), type="character", default="expression_heatmap.pdf",
@@ -87,10 +87,10 @@ option_list <- list(
               help="Y-axis limits for volcano as 'min,max' (default: auto)"),
   
   # Sample Filtering
-  make_option(c("-f", "--filter_column"), type="character", default="Pop",
-              help="Column name to filter samples on (use 'none' for no filtering) [default: %default]"),
-  make_option(c("-v", "--filter_values"), type="character", default="PopNeg,PopPos",
-              help="Comma-separated values to keep (e.g., 'PopNeg,PopPos') [default: %default]"),
+  make_option(c("-f", "--filter_column"), type="character", default=NULL,
+              help="Column name to filter samples on (default: no filtering, all samples kept)"),
+  make_option(c("-v", "--filter_values"), type="character", default=NULL,
+              help="Comma-separated values to keep, e.g. 'PopNeg,PopPos' (required with -f)"),
   
   # Violin/Box Plot Options (only used when --plot_type is violin or boxplot)
   make_option(c("--group_by"), type="character", default="Group",
@@ -135,14 +135,14 @@ option_list <- list(
               help="Row scaling: zscore, none [default: %default]"),
   
   # Annotations
-  make_option(c("-a", "--annotations"), type="character", default="BigGroup,Pop",
-              help="Comma-separated column names for annotations (use 'none' for no annotations) [default: %default]"),
+  make_option(c("-a", "--annotations"), type="character", default=NULL,
+              help="Comma-separated design columns to draw as annotation bars (default: no annotations)"),
   
   # Group Averaging (for heatmaps only)
   make_option(c("--average_groups"), action="store_true", default=FALSE,
               help="Average expression within groups instead of showing individual samples"),
-  make_option(c("--average_by"), type="character", default="Group",
-              help="Column to group samples by for averaging [default: %default]"),
+  make_option(c("--average_by"), type="character", default=NULL,
+              help="Column to group samples by for averaging (required with --average_groups)"),
   make_option(c("--average_function"), type="character", default="mean",
               help="Function for averaging: mean, median [default: %default]"),
   
@@ -240,8 +240,8 @@ opt_parser <- OptionParser(
     "  # Violin plot with custom colors and statistics",
     "  Rscript create_expression_heatmap_cli.R --plot_type violin -g \"IFNG,IL6,TNF,IL1B\" --group_by BigGroup --violin_colors \"#E41A1C,#377EB8,#4DAF4A\" --add_points --add_stats",
     "",
-    "  # All samples, no filtering",
-    "  Rscript create_expression_heatmap_cli.R -f none -a \"Group,BigGroup,Pop\"",
+    "  # All samples (the default), with annotation bars",
+    "  Rscript create_expression_heatmap_cli.R -a \"Group,BigGroup,Pop\"",
     "",
     "  # High-res PNG output",
     "  Rscript create_expression_heatmap_cli.R -o heatmap.png --dpi 600 --width 12 --height 16",
@@ -661,17 +661,39 @@ if (!file.exists(opt$design)) {
   stop(sprintf("Design file not found: %s", opt$design))
 }
 
-# Process filter values
-if (tolower(opt$filter_column) == "none") {
+# Process filter values.
+# Both -f and -v are needed to filter; "none" is still accepted for -f so older
+# commands that spelled out "no filtering" keep working.
+if (is.null(opt$filter_column) || tolower(opt$filter_column) == "none") {
   filter_column <- NULL
   filter_values <- NULL
-  vcat("Sample filtering: DISABLED\n")
+  if (!is.null(opt$filter_values)) {
+    warning("-v/--filter_values given without -f/--filter_column; no filtering applied")
+  }
+  vcat("Sample filtering: DISABLED (all samples kept)\n")
 } else {
+  if (is.null(opt$filter_values)) {
+    stop(sprintf(paste("-f/--filter_column '%s' was given without -v/--filter_values.",
+                       "\nSpecify which values to keep, e.g. -f %s -v \"value1,value2\","),
+                 opt$filter_column, opt$filter_column))
+  }
   filter_column <- opt$filter_column
   filter_values <- strsplit(opt$filter_values, ",")[[1]]
-  filter_values <- trimws(filter_values)  # Remove whitespace
+  filter_values <- trimws(filter_values)
+  filter_values <- filter_values[nchar(filter_values) > 0]
+  if (length(filter_values) == 0) {
+    stop("-v/--filter_values is empty after parsing")
+  }
   vcat(sprintf("Sample filtering: %s in [%s]\n", 
               filter_column, paste(filter_values, collapse=", ")))
+}
+
+# --average_by is only meaningful alongside --average_groups
+if (opt$average_groups && is.null(opt$average_by)) {
+  stop("--average_groups requires --average_by to name the column defining the groups")
+}
+if (!opt$average_groups && !is.null(opt$average_by)) {
+  warning("--average_by given without --average_groups; no averaging will be performed")
 }
 
 # Process gene selection
@@ -730,13 +752,15 @@ if (!is.null(opt$gene_file)) {
   vcat(sprintf("Gene selection: Top %d variable genes\n", opt$n_genes))
 }
 
-# Process annotations
-if (tolower(opt$annotations) == "none") {
+# Process annotations. "none" is still accepted for backward compatibility.
+if (is.null(opt$annotations) || tolower(opt$annotations) == "none") {
   annotation_columns <- NULL
   vcat("Annotations: DISABLED\n")
 } else {
   annotation_columns <- strsplit(opt$annotations, ",")[[1]]
   annotation_columns <- trimws(annotation_columns)
+  annotation_columns <- annotation_columns[nchar(annotation_columns) > 0]
+  if (length(annotation_columns) == 0) annotation_columns <- NULL
   vcat(sprintf("Annotations: %s\n", paste(annotation_columns, collapse=", ")))
 }
 
@@ -1490,3 +1514,5 @@ if (opt$plot_type == "heatmap") {
 }
 
 cat("\nDone!\n")
+
+              
